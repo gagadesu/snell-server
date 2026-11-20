@@ -24,11 +24,13 @@ Run the menu from the project directory.
 python3 snellctl.py
 ```
 
+Use the arrow keys and Enter to navigate, or use the numbered options. Esc goes back. Build and deploy both preselect the latest stable release and label the latest beta when one is available. Confirm the selected version to start a build.
+
 | Option | Action |
 | --- | --- |
 | 1 | Check the official Snell release notes for stable and beta versions. |
-| 2 | Build an exact release, such as `v5.0.1`. The build record includes the download URL, archive SHA-256, and image digest. |
-| 3 | Prepare and deploy an image to an existing Snell and ShadowTLS host. The tool builds the requested version if it has no matching local build record. |
+| 2 | Build an exact release, such as `v5.0.1`. The build record includes the download URL, archive and Dockerfile SHA-256 hashes, and image digest. |
+| 3 | Prepare and deploy an image to an existing Snell and ShadowTLS host. The tool builds the requested version if the saved record does not match the archive and Dockerfile. |
 
 For deployment, the Linux amd64 host needs Docker Compose and permission to pull from the private registry. Supply an SSH alias, the public TCP port, the ShadowTLS handshake endpoint, the existing Compose project name, and two 1Password secret references for the Snell PSK and ShadowTLS password.
 

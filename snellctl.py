@@ -6,11 +6,16 @@ import io
 import json
 import os
 import re
+import select
 import shlex
+import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
+import termios
 import time
+import tty
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +26,79 @@ RELEASES = "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 VERSION = r"v\d+\.\d+\.\d+"
 IMAGE = r"docker\.io/[a-z0-9_-]+/[a-z0-9._-]+@sha256:[a-f0-9]{64}"
 WORKFLOW = "build.yml"
+
+
+def menu_key(fd):
+    key = os.read(fd, 1)
+    if not key or key == b"\x04":
+        raise EOFError
+    if key != b"\x1b":
+        return key.decode("ascii", errors="ignore")
+    if not select.select([fd], [], [], 0.1)[0]:
+        return "escape"
+    if os.read(fd, 1) not in (b"[", b"O"):
+        return ""
+    for _ in range(16):
+        if not select.select([fd], [], [], 0.1)[0]:
+            break
+        suffix = os.read(fd, 1)
+        if not suffix or b"@" <= suffix <= b"~":
+            return {b"A": "up", b"B": "down"}.get(suffix, "")
+    return ""
+
+
+def choose(title, choices, *, default):
+    keys = list(choices)
+    current = keys.index(default)
+    print(f"\n  {title}")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) or os.environ.get("TERM") == "dumb":
+        for key, label in choices.items():
+            print(f"  {key}  {label}")
+        while True:
+            answer = input(f"  Select [{default}]: ").strip() or default
+            if answer in choices:
+                return answer
+            print("  Choose one of the listed options.")
+
+    terminal = shutil.get_terminal_size()
+    rows = min(len(keys), max(1, terminal.lines - 6))
+    color = "\x1b[1;36m" if "NO_COLOR" not in os.environ else ""
+    reset = "\x1b[0m" if color else ""
+    print("  ↑ ↓ Move   ·   Enter Select   ·   Esc Back"[:terminal.columns - 1])
+
+    fd = sys.stdin.fileno()
+    settings = termios.tcgetattr(fd)
+    rendered = False
+    top = 0
+    try:
+        tty.setcbreak(fd)
+        while True:
+            top = max(current - rows + 1, min(top, current))
+            if rendered:
+                sys.stdout.write(f"\x1b[{rows}F")
+            for index in range(top, top + rows):
+                key = keys[index]
+                selected = index == current
+                marker = "›" if selected else " "
+                line = f"  {marker}  {key}  {choices[key]}"[:terminal.columns - 1]
+                sys.stdout.write(f"\x1b[2K{color if selected else ''}{line}{reset if selected else ''}\n")
+            sys.stdout.flush()
+            rendered = True
+
+            while True:
+                key = menu_key(fd)
+                if key in ("\r", "\n"):
+                    return keys[current]
+                if key == "escape":
+                    return None
+                if key in ("up", "down"):
+                    current = (current + (-1 if key == "up" else 1)) % len(keys)
+                    break
+                if key and key in choices:
+                    current = keys.index(key)
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, settings)
 
 
 def public_env():
@@ -42,7 +120,7 @@ def fetch(url):
 
 def source_url(version):
     if not re.fullmatch(VERSION, version):
-        raise ValueError("请输入完整版本号，例如 v5.0.1")
+        raise ValueError("Expected an exact version such as v5.0.1.")
     return f"https://dl.nssurge.com/snell/snell-server-{version}-linux-amd64.zip"
 
 
@@ -50,28 +128,61 @@ def version_key(version):
     return tuple(map(int, version[1:].split(".")))
 
 
-def show_releases():
+def read_releases():
+    print("  Checking the official Snell release notes…", flush=True)
     notes = fetch(RELEASES).decode()
-    headings = list(re.finditer(rf"(?m)^### ({VERSION})\s*$", notes))
+    headings = list(re.finditer(rf"(?m)^### ({VERSION})[ \t]*$", notes))
     if not headings:
-        raise ValueError("无法识别官方发布说明的版本标题")
-    channels = {"正式版": [], "测试版": [], "未能确认渠道": []}
+        raise ValueError("No version headings found in the official release notes.")
+    releases = {}
     for index, heading in enumerate(headings):
         end = headings[index + 1].start() if index + 1 < len(headings) else len(notes)
         section = notes[heading.end():end]
         version = heading[1]
         if re.search(r"\b(?:stable release|generally available|out of beta)\b|正式发布", section, re.I):
-            channels["正式版"].append(version)
+            releases[version] = "stable"
         elif re.search(r"\bbeta\b|\bpre-release\b|release candidate", section, re.I):
-            channels["测试版"].append(version)
+            releases[version] = "beta"
         elif version_key(version) <= (5, 0, 1):
-            channels["正式版"].append(version)
+            # v5.0.1 is the last independently confirmed stable baseline.
+            releases[version] = "stable"
         else:
-            channels["未能确认渠道"].append(version)
-    for label, versions in channels.items():
-        if label != "未能确认渠道" or versions:
-            print(label, max(versions, key=version_key) if versions else "未识别")
-    print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}  {RELEASES}")
+            releases[version] = "unconfirmed"
+    return dict(sorted(releases.items(), key=lambda item: version_key(item[0]), reverse=True))
+
+
+def latest_release(releases, channel):
+    return next((version for version, status in releases.items() if status == channel), None)
+
+
+def show_releases():
+    releases = read_releases()
+    print(f"  Latest stable  {latest_release(releases, 'stable') or 'Unavailable'}")
+    print(f"  Latest beta    {latest_release(releases, 'beta') or 'Unavailable'}")
+    unknown = [version for version, channel in releases.items() if channel == "unconfirmed"]
+    if unknown:
+        print(f"  Unconfirmed    {', '.join(unknown)}")
+    print(f"  {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}  ·  {RELEASES}")
+
+
+def select_release(action):
+    releases = read_releases()
+    stable = latest_release(releases, "stable")
+    beta = latest_release(releases, "beta")
+    versions = {str(index): version for index, version in enumerate(releases, 1)}
+    choices = {}
+    default = "0"
+    for key, version in versions.items():
+        label = version
+        if version == stable:
+            label += " (latest stable)"
+            default = key
+        elif version == beta:
+            label += " (latest beta)"
+        elif releases[version] != "stable":
+            label += f" ({releases[version]})"
+        choices[key] = label
+    return versions.get(choose(f"{action} / Select a version", {**choices, "0": "Back"}, default=default))
 
 
 def load(path, default):
@@ -89,17 +200,23 @@ def save(path, data):
 
 def build(version, *, reuse=False):
     source = source_url(version)
-    archive_hash = hashlib.sha256(fetch(source)).hexdigest()
     settings = load(STATE / "settings.json", {})
     repo = settings.get("github_repo", "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-        raise ValueError("请先在本机 settings.json 设置 github_repo（OWNER/REPO）")
+        raise ValueError("Set github_repo to OWNER/REPO in the local settings.json.")
     scope = settings.get("dockerhub_repository", "")
     if not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9._-]+", scope):
-        raise ValueError("请设置 dockerhub_repository（namespace/repository）")
+        raise ValueError("Set dockerhub_repository to namespace/repository in the local settings.json.")
+    dockerfile_hash = hashlib.sha256((ROOT / "Dockerfile").read_bytes()).hexdigest()
+    print(f"  Calculating the SHA-256 of the official Snell {version} archive…", flush=True)
+    try:
+        archive_hash = hashlib.sha256(fetch(source)).hexdigest()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"Could not download the official archive for {version}. See {source}") from exc
     path = STATE / "builds" / f"{version}.json"
     record = load(path, {})
-    if reuse and valid_build(record, version, archive_hash, scope):
+    if reuse and valid_build(record, version, archive_hash, dockerfile_hash, scope):
+        print(f"  Reusing the saved image for {version}.")
         return record
 
     request = uuid.uuid4().hex
@@ -107,9 +224,10 @@ def build(version, *, reuse=False):
     response = output([
         "gh", "workflow", "run", WORKFLOW, "--repo", repo,
         "-f", f"version={version}", "-f", f"archive_sha256={archive_hash}",
+        "-f", f"dockerfile_sha256={dockerfile_hash}",
         "-f", f"request_id={request}",
     ]).decode()
-    print(response.strip() or f"已触发构建：{run_title}", flush=True)
+    print(response.strip() or f"Build requested: {run_title}", flush=True)
     match = re.search(r"https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)", response)
     run_id = match[1] if match else None
     if run_id is None:
@@ -126,9 +244,12 @@ def build(version, *, reuse=False):
                 break
             time.sleep(3)
     if not run_id:
-        raise ValueError(f"构建已请求，暂未找到运行编号，请在 GitHub Actions 搜索 {request}")
+        raise ValueError(f"Build requested. Search GitHub Actions for {request} to check its status.")
+    run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
+    if not match:
+        print(run_url, flush=True)
     subprocess.run(
-        ["gh", "run", "watch", run_id, "--repo", repo, "--exit-status"],
+        ["gh", "run", "watch", run_id, "--repo", repo, "--compact", "--exit-status"],
         check=True, env=public_env(),
     )
     with tempfile.TemporaryDirectory() as folder:
@@ -137,18 +258,19 @@ def build(version, *, reuse=False):
             "--name", "build-record", "--dir", folder,
         ], check=True, env=public_env())
         record = load(Path(folder) / "build-record.json", {})
-    if not valid_build(record, version, archive_hash, scope):
-        raise ValueError("构建记录与请求的版本、下载文件或镜像仓库不匹配")
+    if not valid_build(record, version, archive_hash, dockerfile_hash, scope):
+        raise ValueError(f"Build record does not match the requested version, archive, Dockerfile, or registry. {run_url}")
     save(path, record)
     return record
 
 
-def valid_build(record, version, archive_hash, scope):
+def valid_build(record, version, archive_hash, dockerfile_hash, scope):
     image = record.get("image", "")
     return (
         record.get("version") == version
         and record.get("source") == source_url(version)
         and record.get("archive_sha256") == archive_hash
+        and record.get("dockerfile_sha256") == dockerfile_hash
         and record.get("platform") == "linux/amd64"
         and re.fullmatch(IMAGE, image) is not None
         and image.startswith(f"docker.io/{scope}@")
@@ -157,46 +279,49 @@ def valid_build(record, version, archive_hash, scope):
 
 def checked_target(target):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", target["ssh"]):
-        raise ValueError("SSH 别名格式无效")
+        raise ValueError("Invalid SSH alias.")
     legacy = target.get("legacy_project", "snell")
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", legacy) or legacy == "snell-managed":
-        raise ValueError("旧 Compose 项目名无效")
+        raise ValueError("Invalid existing Compose project name.")
     port = int(target["port"])
     if not 1 <= port <= 65535:
-        raise ValueError("TCP 端口超出范围")
+        raise ValueError("The public TCP port must be between 1 and 65535.")
     endpoint = target["tls"]
     if not re.fullmatch(r"[A-Za-z0-9.-]+(?::\d{1,5})?", endpoint):
-        raise ValueError("握手目标须为主机名或主机名:端口")
+        raise ValueError("Enter a handshake hostname or hostname:port.")
     if ":" in endpoint and not 1 <= int(endpoint.rsplit(":", 1)[1]) <= 65535:
-        raise ValueError("握手端口超出范围")
+        raise ValueError("The handshake port must be between 1 and 65535.")
     for key in ("psk", "password"):
         if not target[key].startswith("op://"):
-            raise ValueError("凭据字段只接受 1Password 引用")
+            raise ValueError("Enter a 1Password secret reference beginning with op://.")
     return port
 
 
 def select_target():
     path = STATE / "servers.json"
     targets = load(path, [])
-    for index, target in enumerate(targets, 1):
-        print(f"{index}. {target['ssh']}")
-    choice = input("选择服务器编号，或输入 0 添加：").strip()
+    choices = {str(index): target["ssh"] for index, target in enumerate(targets, 1)}
+    choice = choose(
+        "Deploy / Select a server",
+        {**choices, "0": "Add a server", "b": "Back"},
+        default="1" if targets else "0",
+    )
+    if choice in (None, "b"):
+        return None
     if choice == "0":
         target = {
-            "ssh": input("SSH 别名：").strip(),
-            "port": int(input("原公网 TCP 端口：")),
-            "tls": input("原 ShadowTLS 握手目标（主机名:端口）：").strip(),
-            "legacy_project": input("旧 Compose 项目名 [snell]：").strip() or "snell",
-            "psk": input("Snell PSK 的 op:// 引用：").strip(),
-            "password": input("ShadowTLS 密码的 op:// 引用：").strip(),
+            "ssh": input("  SSH alias: ").strip(),
+            "port": int(input("  Existing public TCP port: ")),
+            "tls": input("  ShadowTLS handshake target (hostname:port): ").strip(),
+            "legacy_project": input("  Existing Compose project [snell]: ").strip() or "snell",
+            "psk": input("  Snell PSK secret reference: ").strip(),
+            "password": input("  ShadowTLS password secret reference: ").strip(),
         }
         checked_target(target)
         if any(existing["ssh"] == target["ssh"] for existing in targets):
-            raise ValueError("该 SSH 别名已存在，请编辑本机 servers.json")
+            raise ValueError("That SSH alias is already saved. Edit the local servers.json to change it.")
         save(path, targets + [target])
         return target
-    if not choice.isdigit() or not 1 <= int(choice) <= len(targets):
-        raise ValueError("服务器编号无效")
     return targets[int(choice) - 1]
 
 
@@ -205,8 +330,10 @@ def secret(reference):
         ["op", "read", "--no-newline", reference],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
     )
-    if value.returncode or not value.stdout or b"\0" in value.stdout:
-        raise ValueError("1Password 读取失败，或凭据为空或包含 NUL")
+    if value.returncode:
+        raise ValueError("1Password could not read the secret. Check CLI authorization and the secret reference.")
+    if not value.stdout or b"\0" in value.stdout:
+        raise ValueError("1Password returned an empty secret or one containing a NUL byte.")
     return value.stdout.decode()
 
 
@@ -231,7 +358,7 @@ def shadow_config(endpoint, password):
 def bundle(record, target, port):
     psk = secret(target["psk"])
     if not re.fullmatch(r"[!-~]+", psk) or "#" in psk or ";" in psk:
-        raise ValueError("Snell PSK 含空白、非 ASCII 字符或 INI 注释分隔符，需核实旧配置格式")
+        raise ValueError("The Snell PSK contains whitespace, non-ASCII characters, or INI comment delimiters.")
     files = {
         "compose.yaml": (ROOT / "deploy" / "compose.yaml").read_bytes(),
         ".env": f"SNELL_IMAGE={record['image']}\nPUBLIC_PORT={port}\n".encode(),
@@ -259,52 +386,70 @@ def remote(target, script, *args, stdin=None):
 
 
 def deploy():
-    version = input("要部署的版本：").strip()
-    source_url(version)
+    version = select_release("Deploy")
+    if version is None:
+        return
     target = select_target()
+    if target is None:
+        return
     port = checked_target(target)
     legacy = target.get("legacy_project", "snell")
     script = (ROOT / "deploy" / "remote.sh").read_text()
     previous = remote(target, script, "preflight", legacy)
-    print(f"目标 {target['ssh']} 的旧 Compose 项目 {legacy}\n{previous}")
+    print(f"  Server       {target['ssh']}\n  Old project  {legacy}\n{previous}")
     record = build(version, reuse=True)
-    print(f"新 Snell {version}，公网 TCP {port}\n{record['image']}")
-    print("回滚目标是原 Compose 项目。请核对预检给出的恢复方式。")
-    if input("读取两个 1Password 凭据并暂存新配置？输入 stage：").strip() != "stage":
+    print(f"  New release  {version}\n  Public port  {port}/tcp\n  Image        {record['image']}")
+    print("  Rollback uses the original Compose project. See the preflight output above.")
+    if input("  Read the 1Password secrets and prepare the deployment? Type stage: ").strip() != "stage":
+        print("  Deployment canceled.")
         return
     stage = remote(target, script, "stage", stdin=bundle(record, target, port))
     if not re.fullmatch(r"stage\.[A-Za-z0-9]+", stage):
-        raise ValueError("远端未返回有效暂存目录，请检查远端状态")
+        raise ValueError("The server did not return a valid staging directory. Check the remote state.")
     try:
-        print(f"暂存完成。请确认 {target['ssh']} 的旧项目 {legacy} 已停止。")
-        if input("确认释放原入口并启动新服务？输入 start：").strip() != "start":
+        print(f"  Deployment prepared. Confirm the old {legacy} project is stopped on {target['ssh']}.")
+        if input("  Verify the port and start the new services? Type start: ").strip() != "start":
+            print("  Deployment canceled.")
             return
         print(remote(target, script, "start", stage, str(port), legacy))
     finally:
         remote(target, script, "discard", stage)
-    print("容器已启动。请在 Surge 测试此节点，代理链路验收仍待完成。")
+    print("  Containers started. Test the proxy connection from your client.")
 
 
 def main():
+    actions = {
+        "1": "Check official releases",
+        "2": "Build an image",
+        "3": "Prepare and deploy",
+        "0": "Quit",
+    }
     while True:
-        print("\n1. 查询官方版本\n2. 构建指定版本\n3. 准备并部署\n0. 退出")
         try:
-            choice = input("选择：").strip()
-            if choice == "0":
+            choice = choose("SNELL SERVER", actions, default="1")
+            if choice in (None, "0"):
                 return
             if choice == "1":
                 show_releases()
             elif choice == "2":
-                record = build(input("构建版本：").strip())
-                print(json.dumps(record, ensure_ascii=False, indent=2))
+                version = select_release("Build")
+                if version is None:
+                    continue
+                if input(f"  Start a GitHub Actions build for {version}? [y/N]: ").strip().lower() not in ("y", "yes"):
+                    print("  Build canceled.")
+                    continue
+                record = build(version)
+                print(f"\n  Image published  {record['tag']}")
+                print(f"  Image            {record['image']}")
+                print(f"  Build record     {STATE / 'builds' / (version + '.json')}")
             elif choice == "3":
                 deploy()
         except (EOFError, KeyboardInterrupt):
             return
         except subprocess.CalledProcessError as exc:
-            print(f"{Path(exc.cmd[0]).name} 失败（退出码 {exc.returncode}），请查看上方阶段信息。")
+            print(f"  {Path(exc.cmd[0]).name} exited with status {exc.returncode}. See the output above.")
         except (OSError, ValueError, KeyError) as exc:
-            print(f"操作失败：{exc}")
+            print(f"  Error: {exc}")
 
 
 if __name__ == "__main__":

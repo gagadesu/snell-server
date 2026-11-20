@@ -11,6 +11,10 @@ on:
         description: SHA-256 of the official Linux amd64 archive
         required: true
         type: string
+      dockerfile_sha256:
+        description: Expected Dockerfile SHA-256 from the local CLI
+        required: false
+        type: string
       request_id:
         description: Request ID from the local CLI
         required: false
@@ -30,9 +34,10 @@ jobs:
     env:
       SNELL_VERSION: ${{ inputs.version }}
       ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+      EXPECTED_DOCKERFILE_SHA256: ${{ inputs.dockerfile_sha256 }}
       IMAGE_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Download and verify the official archive
@@ -40,18 +45,27 @@ jobs:
           [[ "$SNELL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$IMAGE_REPOSITORY" =~ ^[a-z0-9]+([_-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]
+          dockerfile_sha256="$(sha256sum Dockerfile | cut -d ' ' -f 1)"
+          if [[ -n "$EXPECTED_DOCKERFILE_SHA256" && "$EXPECTED_DOCKERFILE_SHA256" != "$dockerfile_sha256" ]]; then
+            echo 'The workflow checkout does not match the requested Dockerfile.' >&2
+            exit 1
+          fi
           url="https://dl.nssurge.com/snell/snell-server-${SNELL_VERSION}-linux-amd64.zip"
           curl -fsSL --proto '=https' --proto-redir '=https' --max-time 60 "$url" -o "$RUNNER_TEMP/snell.zip"
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$RUNNER_TEMP/snell.zip" | sha256sum --check -
           mkdir build-input
           unzip -p "$RUNNER_TEMP/snell.zip" snell-server > build-input/snell-server
           printf 'SNELL_SOURCE=%s\n' "$url" >> "$GITHUB_ENV"
+          printf 'DOCKERFILE_SHA256=%s\n' "$dockerfile_sha256" >> "$GITHUB_ENV"
       - name: Build and smoke-test the image
         run: |
           docker build --pull --platform linux/amd64 --tag local-snell-test .
-          printf '[snell-server]\nlisten = 0.0.0.0:28261\npsk = synthetic-ci-test-password\n' > "$RUNNER_TEMP/snell.conf"
+          fixture="$RUNNER_TEMP/snell-fixture"
+          mkdir -m 0700 "$fixture"
+          printf '[snell-server]\nlisten = 0.0.0.0:28261\npsk = synthetic-ci-test-password\n' > "$fixture/snell.conf"
+          chmod 0444 "$fixture/snell.conf"
           docker run -d --name snell-test --read-only --cap-drop ALL \
-            --mount "type=bind,source=$RUNNER_TEMP/snell.conf,target=/run/secrets/snell.conf,readonly" \
+            --mount "type=bind,source=$fixture/snell.conf,target=/run/secrets/snell.conf,readonly" \
             -p 127.0.0.1::28261 local-snell-test
           trap 'docker rm -f snell-test >/dev/null' EXIT
           endpoint="$(docker port snell-test 28261/tcp)"
@@ -62,11 +76,13 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' snell-test)" = true
       - name: Smoke-test the ShadowTLS Compose entry
         run: |
-          cp deploy/compose.yaml "$RUNNER_TEMP/compose.yaml"
+          fixture="$RUNNER_TEMP/snell-fixture"
+          cp deploy/compose.yaml "$fixture/compose.yaml"
           python3 -c 'import json, snellctl; print(json.dumps(snellctl.shadow_config("example.org:443", "synthetic-ci-shadow-password")))' \
-            > "$RUNNER_TEMP/shadow-tls.json"
+            > "$fixture/shadow-tls.json"
+          chmod 0444 "$fixture/shadow-tls.json"
           export SNELL_IMAGE=local-snell-test PUBLIC_PORT=18443
-          compose=(docker compose -p snell-ci -f "$RUNNER_TEMP/compose.yaml")
+          compose=(docker compose -p snell-ci -f "$fixture/compose.yaml")
           trap '"${compose[@]}" down --remove-orphans' EXIT
           "${compose[@]}" pull shadow-tls
           "${compose[@]}" up --detach --pull never --wait --wait-timeout 30
@@ -95,10 +111,12 @@ jobs:
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           jq -n --arg version "$SNELL_VERSION" --arg source "$SNELL_SOURCE" \
             --arg archive_sha256 "$ARCHIVE_SHA256" --arg image "$image@$digest" \
+            --arg dockerfile_sha256 "$DOCKERFILE_SHA256" \
             --arg git_commit "$GITHUB_SHA" --arg tag "$tag" \
             '{version:$version, source:$source, archive_sha256:$archive_sha256, image:$image,
-              git_commit:$git_commit, tag:$tag, platform:"linux/amd64"}' > build-record.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+              dockerfile_sha256:$dockerfile_sha256, git_commit:$git_commit, tag:$tag,
+              platform:"linux/amd64"}' > build-record.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-record
           path: build-record.json
