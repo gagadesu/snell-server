@@ -1,0 +1,105 @@
+name: Build Snell
+run-name: Snell ${{ inputs.version }} (${{ inputs.request_id }})
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact Snell release, e.g. v5.0.1
+        required: true
+        type: string
+      archive_sha256:
+        description: SHA-256 of the official Linux amd64 archive
+        required: true
+        type: string
+      request_id:
+        description: Request ID from the local CLI
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SNELL_VERSION: ${{ inputs.version }}
+      ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+      IMAGE_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download and verify the official archive
+        run: |
+          [[ "$SNELL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$IMAGE_REPOSITORY" =~ ^[a-z0-9]+([_-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]
+          url="https://dl.nssurge.com/snell/snell-server-${SNELL_VERSION}-linux-amd64.zip"
+          curl -fsSL --proto '=https' --proto-redir '=https' --max-time 60 "$url" -o "$RUNNER_TEMP/snell.zip"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$RUNNER_TEMP/snell.zip" | sha256sum --check -
+          mkdir build-input
+          unzip -p "$RUNNER_TEMP/snell.zip" snell-server > build-input/snell-server
+          printf 'SNELL_SOURCE=%s\n' "$url" >> "$GITHUB_ENV"
+      - name: Build and smoke-test the image
+        run: |
+          docker build --pull --platform linux/amd64 --tag local-snell-test .
+          printf '[snell-server]\nlisten = 0.0.0.0:28261\npsk = synthetic-ci-test-password\n' > "$RUNNER_TEMP/snell.conf"
+          docker run -d --name snell-test --read-only --cap-drop ALL \
+            --mount "type=bind,source=$RUNNER_TEMP/snell.conf,target=/run/secrets/snell.conf,readonly" \
+            -p 127.0.0.1::28261 local-snell-test
+          trap 'docker rm -f snell-test >/dev/null' EXIT
+          endpoint="$(docker port snell-test 28261/tcp)"
+          if ! timeout 15 bash -c 'until (: > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; do sleep 1; done' _ "${endpoint##*:}"; then
+            docker logs snell-test
+            exit 1
+          fi
+          test "$(docker inspect --format '{{.State.Running}}' snell-test)" = true
+      - name: Smoke-test the ShadowTLS Compose entry
+        run: |
+          cp deploy/compose.yaml "$RUNNER_TEMP/compose.yaml"
+          python3 -c 'import json, snellctl; print(json.dumps(snellctl.shadow_config("example.org:443", "synthetic-ci-shadow-password")))' \
+            > "$RUNNER_TEMP/shadow-tls.json"
+          export SNELL_IMAGE=local-snell-test PUBLIC_PORT=18443
+          compose=(docker compose -p snell-ci -f "$RUNNER_TEMP/compose.yaml")
+          trap '"${compose[@]}" down --remove-orphans' EXIT
+          "${compose[@]}" pull shadow-tls
+          "${compose[@]}" up --detach --pull never --wait --wait-timeout 30
+          timeout 15 bash -c 'until (: >/dev/tcp/127.0.0.1/18443) 2>/dev/null; do sleep 1; done'
+      - name: Verify private repository and publish
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+        run: |
+          token="$(jq -nc '{identifier:env.DOCKERHUB_USERNAME,secret:env.DOCKERHUB_TOKEN}' |
+            curl -fsS --max-time 30 -H 'Content-Type: application/json' --data-binary @- 'https://hub.docker.com/v2/auth/token' |
+            jq -er '.access_token | strings | select(length > 0)')"
+          echo "::add-mask::$token"
+          namespace="${IMAGE_REPOSITORY%/*}"
+          repo="${IMAGE_REPOSITORY#*/}"
+          curl -fsS --max-time 30 -H "Authorization: Bearer $token" \
+            "https://hub.docker.com/v2/namespaces/$namespace/repositories/$repo" |
+            jq -e '.is_private == true' >/dev/null
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+          trap 'docker logout >/dev/null' EXIT
+          image="docker.io/$IMAGE_REPOSITORY"
+          tag="$SNELL_VERSION-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker tag local-snell-test "$image:$tag"
+          docker push "$image:$tag" | tee "$RUNNER_TEMP/push.log"
+          digest="$(awk -v tag="$tag:" '$1 == tag && $2 == "digest:" {print $3}' "$RUNNER_TEMP/push.log")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg version "$SNELL_VERSION" --arg source "$SNELL_SOURCE" \
+            --arg archive_sha256 "$ARCHIVE_SHA256" --arg image "$image@$digest" \
+            --arg git_commit "$GITHUB_SHA" --arg tag "$tag" \
+            '{version:$version, source:$source, archive_sha256:$archive_sha256, image:$image,
+              git_commit:$git_commit, tag:$tag, platform:"linux/amd64"}' > build-record.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-record
+          path: build-record.json
+          if-no-files-found: error

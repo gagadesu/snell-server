@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!build-input/
+!build-input/snell-server
