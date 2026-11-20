@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local menu for building and preparing the Snell deployment."""
 
+import getpass
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import termios
 import time
 import tty
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +27,15 @@ STATE = Path.home() / ".config" / "snell-server"
 RELEASES = "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 VERSION = r"v\d+\.\d+\.\d+"
 IMAGE = r"docker\.io/[a-z0-9_-]+/[a-z0-9._-]+@sha256:[a-f0-9]{64}"
+SSH_ALIAS = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 WORKFLOW = "build.yml"
+PULL_AUTH_REQUIRED = 20  # Exit status reserved by deploy/remote.sh.
+
+
+def menu_label(icon, label):
+    if sys.stdout.isatty():
+        return f"{icon}  {label}"
+    return label
 
 
 def menu_key(fd):
@@ -278,11 +288,8 @@ def valid_build(record, version, archive_hash, dockerfile_hash, scope):
 
 
 def checked_target(target):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", target["ssh"]):
+    if not re.fullmatch(SSH_ALIAS, target["ssh"]):
         raise ValueError("Invalid SSH alias.")
-    legacy = target.get("legacy_project", "snell")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", legacy) or legacy == "snell-managed":
-        raise ValueError("Invalid existing Compose project name.")
     port = int(target["port"])
     if not 1 <= port <= 65535:
         raise ValueError("The public TCP port must be between 1 and 65535.")
@@ -297,30 +304,93 @@ def checked_target(target):
     return port
 
 
+def unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+        return value[1:-1].strip()
+    return value
+
+
+def prompt_secret_reference(prompt, default):
+    while True:
+        reference = unquote(input(prompt).strip() or default)
+        if reference.startswith("op://"):
+            return reference
+        print("  Enter a 1Password secret reference beginning with op://.")
+
+
+def add_target(targets):
+    alias = input("  SSH alias: ").strip()
+    if not re.fullmatch(SSH_ALIAS, alias):
+        raise ValueError("Invalid SSH alias.")
+    if any(target["ssh"].casefold() == alias.casefold() for target in targets):
+        raise ValueError("That SSH alias is already saved. Select it from the server list.")
+
+    fields = {
+        "port": "Public TCP port",
+        "tls": "ShadowTLS handshake target (hostname:port)",
+        "psk": "Snell PSK secret reference",
+        "password": "ShadowTLS password secret reference",
+    }
+    defaults = {"ssh": alias, "port": 8443}
+    if targets:
+        previous = targets[-1]
+        for key in ("port", "tls"):
+            if previous.get(key):
+                defaults[key] = previous[key]
+        for key, field in (("psk", "snell-psk"), ("password", "shadowtls-password")):
+            scheme, _, uri = previous.get(key, "").partition("://")
+            parts = uri.split("/")
+            if (
+                scheme == "op"
+                and len(parts) == 3
+                and parts[0]
+                and parts[1:] == [f"snell-{previous['ssh']}", field]
+            ):
+                defaults[key] = f"op://{parts[0]}/snell-{alias}/{field}"
+
+    customize = True
+    if all(key in defaults for key in fields):
+        print(f"\n  Defaults for {alias}")
+        for key, label in fields.items():
+            print(f"  {label:<41} {defaults[key]}")
+        choice = choose(
+            "Deploy / Server settings",
+            {"1": menu_label("\uf00c", "Use defaults"), "2": menu_label("\uf013", "Customize"), "b": "Back"},
+            default="1",
+        )
+        if choice in (None, "b"):
+            return None
+        customize = choice == "2"
+
+    if customize:
+        for key, label in fields.items():
+            default = defaults.get(key, "")
+            hint = f" [{default}]" if default else ""
+            prompt = f"  {label}{hint}: "
+            if key in ("psk", "password"):
+                defaults[key] = prompt_secret_reference(prompt, default)
+            else:
+                defaults[key] = input(prompt).strip() or default
+    defaults["port"] = checked_target(defaults)
+    return defaults
+
+
 def select_target():
     path = STATE / "servers.json"
     targets = load(path, [])
     choices = {str(index): target["ssh"] for index, target in enumerate(targets, 1)}
     choice = choose(
         "Deploy / Select a server",
-        {**choices, "0": "Add a server", "b": "Back"},
+        {**choices, "0": menu_label("\uf067", "Add a server"), "b": "Back"},
         default="1" if targets else "0",
     )
     if choice in (None, "b"):
         return None
     if choice == "0":
-        target = {
-            "ssh": input("  SSH alias: ").strip(),
-            "port": int(input("  Existing public TCP port: ")),
-            "tls": input("  ShadowTLS handshake target (hostname:port): ").strip(),
-            "legacy_project": input("  Existing Compose project [snell]: ").strip() or "snell",
-            "psk": input("  Snell PSK secret reference: ").strip(),
-            "password": input("  ShadowTLS password secret reference: ").strip(),
-        }
-        checked_target(target)
-        if any(existing["ssh"] == target["ssh"] for existing in targets):
-            raise ValueError("That SSH alias is already saved. Edit the local servers.json to change it.")
-        save(path, targets + [target])
+        target = add_target(targets)
+        if target is not None:
+            save(path, targets + [target])
         return target
     return targets[int(choice) - 1]
 
@@ -385,6 +455,44 @@ def remote(target, script, *args, stdin=None):
     ], stdin=stdin).decode().strip()
 
 
+def login_to_docker_hub(target, script, default_username):
+    print(f"  Docker Hub denied access to the Snell image on {target['ssh']}.")
+    print("  Sign in on the server with a Docker Hub token that can pull from this repository.")
+    print("  Docker will save the login for the SSH user. Leave the token blank to cancel.")
+    while True:
+        username = input(f"  Docker Hub username [{default_username}]: ").strip() or default_username
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", username):
+            print("  Enter a valid Docker Hub username.")
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            try:
+                credential = getpass.getpass("  Docker Hub token or op:// reference: ")
+            except getpass.GetPassWarning as exc:
+                raise ValueError("Use a terminal that supports hidden token entry.") from exc
+        if not credential.strip():
+            return False
+        token = unquote(credential)
+        if token.startswith("op://"):
+            try:
+                token = secret(token).strip()
+            except ValueError as exc:
+                print(f"  {exc}")
+                continue
+        if not re.fullmatch(r"[!-~]+", token):
+            print("  Enter a token without spaces or line breaks.")
+            continue
+        try:
+            remote(target, script, "login", username, stdin=(token + "\n").encode())
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            print("  Login failed. Try again or leave the token blank to cancel.")
+            continue
+        print("  Docker Hub login succeeded. Retrying image pull.")
+        return True
+
+
 def deploy():
     version = select_release("Deploy")
     if version is None:
@@ -393,25 +501,33 @@ def deploy():
     if target is None:
         return
     port = checked_target(target)
-    legacy = target.get("legacy_project", "snell")
     script = (ROOT / "deploy" / "remote.sh").read_text()
-    previous = remote(target, script, "preflight", legacy)
-    print(f"  Server       {target['ssh']}\n  Old project  {legacy}\n{previous}")
+    remote(target, script, "preflight")
+    print(f"  Server       {target['ssh']}")
     record = build(version, reuse=True)
     print(f"  New release  {version}\n  Public port  {port}/tcp\n  Image        {record['image']}")
-    print("  Rollback uses the original Compose project. See the preflight output above.")
     if input("  Read the 1Password secrets and prepare the deployment? Type stage: ").strip() != "stage":
         print("  Deployment canceled.")
         return
-    stage = remote(target, script, "stage", stdin=bundle(record, target, port))
+    archive = bundle(record, target, port)
+    while True:
+        try:
+            stage = remote(target, script, "stage", stdin=archive)
+            break
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != PULL_AUTH_REQUIRED:
+                raise
+            if not login_to_docker_hub(target, script, record["image"].split("/", 2)[1]):
+                print("  Deployment canceled.")
+                return
     if not re.fullmatch(r"stage\.[A-Za-z0-9]+", stage):
         raise ValueError("The server did not return a valid staging directory. Check the remote state.")
     try:
-        print(f"  Deployment prepared. Confirm the old {legacy} project is stopped on {target['ssh']}.")
+        print(f"  Deployment prepared on {target['ssh']}.")
         if input("  Verify the port and start the new services? Type start: ").strip() != "start":
             print("  Deployment canceled.")
             return
-        print(remote(target, script, "start", stage, str(port), legacy))
+        print(remote(target, script, "start", stage, str(port)))
     finally:
         remote(target, script, "discard", stage)
     print("  Containers started. Test the proxy connection from your client.")
@@ -419,10 +535,10 @@ def deploy():
 
 def main():
     actions = {
-        "1": "Check official releases",
-        "2": "Build an image",
-        "3": "Prepare and deploy",
-        "0": "Quit",
+        "1": menu_label("\uf02d", "Check official releases"),
+        "2": menu_label("\uf1b2", "Build an image"),
+        "3": menu_label("\uf233", "Prepare and deploy"),
+        "0": menu_label("\uf011", "Quit"),
     }
     while True:
         try:

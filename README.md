@@ -26,16 +26,20 @@ python3 snellctl.py
 
 Use the arrow keys and Enter to navigate, or use the numbered options. Esc goes back. Build and deploy both preselect the latest stable release and label the latest beta when one is available. Confirm the selected version to start a build.
 
+Interactive menus display icons by default. Select a Nerd Font in your terminal to render them. [Nerd Fonts](https://www.nerdfonts.com/)
+
 | Option | Action |
 | --- | --- |
 | 1 | Check the official Snell release notes for stable and beta versions. |
 | 2 | Build an exact release, such as `v5.0.1`. The build record includes the download URL, archive and Dockerfile SHA-256 hashes, and image digest. |
-| 3 | Prepare and deploy an image to an existing Snell and ShadowTLS host. The tool builds the requested version if the saved record does not match the archive and Dockerfile. |
+| 3 | Deploy Snell and ShadowTLS to a Linux host. The tool builds the requested version if the saved record does not match the archive and Dockerfile. |
 
-For deployment, the Linux amd64 host needs Docker Compose and permission to pull from the private registry. Supply an SSH alias, the public TCP port, the ShadowTLS handshake endpoint, the existing Compose project name, and two 1Password secret references for the Snell PSK and ShadowTLS password.
+For deployment, the Linux amd64 host needs Docker Compose. Supply an SSH alias, a free public TCP port, the ShadowTLS handshake endpoint, and two 1Password secret references for the Snell PSK and ShadowTLS password.
 
-Choose `stage` to read the credentials and prepare the deployment. Stop the existing Compose services, then choose `start` to activate the new project. Verify the connection from your client after startup.
+When adding a server, the last saved server supplies the port and handshake target defaults. For references named `op://<vault>/snell-<ssh-alias>/snell-psk` and `op://<vault>/snell-<ssh-alias>/shadowtls-password`, the tool fills in the new alias. Press Enter at **Use defaults**, or choose **Customize** to override individual fields. Any field without a default needs a value.
 
-## Rollback
+Choose `stage` to read the credentials and prepare the deployment. If Docker Hub denies the private image pull, enter your Docker Hub username and a read-only access token or its `op://` reference at the hidden prompt. Docker saves the login on the target server for the SSH user, and the tool retries the pull. Enter `start` to activate the new project, then verify the connection from your client.
 
-Stop the new project from its deployment directory, `~/.local/share/snell-server/active`, with `docker compose -p snell-managed down`. Restore the previous project using its original Compose file and project name. Use `docker compose start` if its containers still exist, or `docker compose up --detach --pull never --no-build` if they need to be recreated from local images.
+## Stop a deployment
+
+Run `docker compose -p snell-managed down` from the deployment directory, `~/.local/share/snell-server/active`. If this deployment replaced an existing service, restore that service using its own configuration.

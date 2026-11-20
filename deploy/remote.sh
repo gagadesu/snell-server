@@ -6,7 +6,6 @@ unset SNELL_IMAGE PUBLIC_PORT COMPOSE_PROFILES
 root="$HOME/.local/share/snell-server"
 active="$root/active"
 project=snell-managed
-legacy_file="$HOME/.config/containers/snell/docker-compose.yml"
 
 fail() {
     printf '%s\n' "$*" >&2
@@ -25,27 +24,6 @@ compose() {
     docker compose --project-name "$project" --env-file "$directory/.env" -f "$directory/compose.yaml" "$@"
 }
 
-legacy_restore() {
-    legacy="$1"
-    previous="$(docker ps -a --filter "label=com.docker.compose.project=$legacy" \
-        --format '{{.Names}}  {{.Image}}  {{.Status}}')"
-    if [ -n "$previous" ]; then
-        printf '%s\n' "$previous"
-        printf 'The old containers still exist. Use compose start with the original project to roll back.\n'
-        return
-    fi
-
-    [ -r "$legacy_file" ] || fail 'The old containers were removed and the old Compose file is missing.'
-    images="$(docker compose -p "$legacy" -f "$legacy_file" config --images 2>/dev/null)" ||
-        fail 'The old containers were removed and the old Compose image list could not be read.'
-    [ -n "$images" ] || fail 'The old Compose file contains no images to restore.'
-    printf '%s\n' "$images" | while IFS= read -r image; do
-        docker image inspect --format '{{.Id}}' "$image" >/dev/null 2>&1 ||
-            fail "An image needed for rollback is missing locally: $image"
-    done
-    printf 'The old containers were removed. Rollback can recreate them from local images with compose up --detach --pull never --no-build.\n'
-}
-
 operation="$1"
 case "$operation" in
     preflight)
@@ -55,7 +33,9 @@ case "$operation" in
         command -v ss >/dev/null
         docker compose version >/dev/null
         require_inactive
-        legacy_restore "$2"
+        ;;
+    login)
+        docker login --username "$2" --password-stdin || fail 'Docker Hub login failed.'
         ;;
     stage)
         require_inactive
@@ -71,7 +51,17 @@ case "$operation" in
             chmod 0444 "$stage/$secret" || fail "Could not set permissions on $secret."
         done
         compose "$stage" config --quiet || fail 'Compose configuration validation failed.'
-        compose "$stage" pull >&2 || fail 'Image pull failed. Check the private registry credentials.'
+        if pull_output="$(compose "$stage" pull snell 2>&1)"; then
+            printf '%s\n' "$pull_output" >&2
+        else
+            if printf '%s\n' "$pull_output" | grep -Eiq \
+                'pull access denied|requested access to the resource is denied|unauthorized(:|$)|authentication required|insufficient_scope'; then
+                exit 20
+            fi
+            printf '%s\n' "$pull_output" >&2
+            fail 'Could not pull the Snell image.'
+        fi
+        compose "$stage" pull shadow-tls >&2 || fail 'Could not pull the public ShadowTLS image.'
         trap - EXIT
         basename "$stage"
         ;;
@@ -91,14 +81,11 @@ case "$operation" in
         flock -n 9 || fail 'Another deployment is starting.'
         require_inactive
         port="$3"
-        running="$(docker ps -q --filter "label=com.docker.compose.project=$4")"
-        [ -z "$running" ] || fail 'The old project still has running containers. Stop them before starting the new project.'
-        legacy_restore "$4" >&2
         listeners="$(ss -H -lnt "sport = :$port")" || fail 'Could not check the public port.'
-        [ -z "$listeners" ] || fail 'The public port is in use. Check that the old ShadowTLS is stopped.'
+        [ -z "$listeners" ] || fail 'The public port is in use. Free it before starting the new services.'
         mv -- "$stage" "$active"
         compose "$active" up --detach --pull never --wait --wait-timeout 30 >&2 ||
-            fail 'Startup failed. Deployment files remain in active. See the README for rollback steps.'
+            fail 'Startup failed. Deployment files remain in active. See the README to stop the deployment.'
         compose "$active" ps
         ;;
     *) fail 'Unknown remote operation.' ;;
