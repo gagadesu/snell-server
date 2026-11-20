@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local menu for building and preparing the Snell deployment."""
 
+import fcntl
 import getpass
 import hashlib
 import io
@@ -203,9 +204,13 @@ def load(path, default):
 
 def save(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
-    os.replace(handle.name, path)
+    handle = tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False)
+    try:
+        with handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(handle.name, path)
+    finally:
+        Path(handle.name).unlink(missing_ok=True)
 
 
 def build(version, *, reuse=False):
@@ -287,6 +292,14 @@ def valid_build(record, version, archive_hash, dockerfile_hash, scope):
     )
 
 
+def validate_target_secret(key, value):
+    if key == "psk":
+        if not re.fullmatch(r"[!-~]+", value) or "#" in value or ";" in value:
+            raise ValueError("Enter a nonempty Snell PSK using printable ASCII without spaces, # or ;.")
+    elif not value or "\0" in value:
+        raise ValueError("Enter a nonempty ShadowTLS password without NUL characters.")
+
+
 def checked_target(target):
     if not re.fullmatch(SSH_ALIAS, target["ssh"]):
         raise ValueError("Invalid SSH alias.")
@@ -300,7 +313,7 @@ def checked_target(target):
         raise ValueError("The handshake port must be between 1 and 65535.")
     for key in ("psk", "password"):
         if not target[key].startswith("op://"):
-            raise ValueError("Enter a 1Password secret reference beginning with op://.")
+            validate_target_secret(key, target[key])
     return port
 
 
@@ -311,12 +324,27 @@ def unquote(value):
     return value
 
 
-def prompt_secret_reference(prompt, default):
+def prompt_target_secret(key, prompt, default):
     while True:
-        reference = unquote(input(prompt).strip() or default)
+        if sys.stdin.isatty():
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                try:
+                    value = getpass.getpass(prompt)
+                except getpass.GetPassWarning as exc:
+                    raise ValueError("Use a terminal that supports hidden password entry.") from exc
+        else:
+            value = input(prompt)
+        value = value or default
+        reference = unquote(value)
         if reference.startswith("op://"):
             return reference
-        print("  Enter a 1Password secret reference beginning with op://.")
+        try:
+            validate_target_secret(key, value)
+        except ValueError as exc:
+            print(f"  {exc}")
+        else:
+            return value
 
 
 def add_target(targets):
@@ -329,8 +357,8 @@ def add_target(targets):
     fields = {
         "port": "Public TCP port",
         "tls": "ShadowTLS handshake target (hostname:port)",
-        "psk": "Snell PSK secret reference",
-        "password": "ShadowTLS password secret reference",
+        "psk": "Snell PSK",
+        "password": "ShadowTLS password",
     }
     defaults = {"ssh": alias, "port": 8443}
     if targets:
@@ -364,35 +392,77 @@ def add_target(targets):
         customize = choice == "2"
 
     if customize:
+        print("  Enter a password or an op:// reference for each credential.")
         for key, label in fields.items():
             default = defaults.get(key, "")
             hint = f" [{default}]" if default else ""
             prompt = f"  {label}{hint}: "
             if key in ("psk", "password"):
-                defaults[key] = prompt_secret_reference(prompt, default)
+                defaults[key] = prompt_target_secret(key, prompt, default)
             else:
                 defaults[key] = input(prompt).strip() or default
     defaults["port"] = checked_target(defaults)
     return defaults
 
 
+def update_saved_targets(path, *, old=None, new=None):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Lock a separate file so replacing servers.json leaves the lock in place.
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        targets = load(path, [])
+        if old is not None:
+            if old not in targets:
+                return False
+            index = targets.index(old)
+            targets[index:index + 1] = [] if new is None else [new]
+        else:
+            if any(saved["ssh"].casefold() == new["ssh"].casefold() for saved in targets):
+                raise ValueError("That SSH alias is already saved. Select it from the server list.")
+            targets.append(new)
+        save(path, targets)
+    return True
+
+
+def remove_target(path, targets, choices):
+    choice = choose("Deploy / Remove a saved server", {**choices, "b": "Back"}, default="b")
+    if choice in (None, "b"):
+        return
+    target = targets[int(choice) - 1]
+    alias = target["ssh"]
+    choice = choose(
+        f"Deploy / Remove {alias} from the local server list?",
+        {"r": "Remove", "b": "Cancel"},
+        default="b",
+    )
+    if choice == "r":
+        if update_saved_targets(path, old=target):
+            print(f"  Removed {alias} from the local server list.")
+        else:
+            print(f"  The saved entry for {alias} changed. Select it again to remove it.")
+
+
 def select_target():
     path = STATE / "servers.json"
-    targets = load(path, [])
-    choices = {str(index): target["ssh"] for index, target in enumerate(targets, 1)}
-    choice = choose(
-        "Deploy / Select a server",
-        {**choices, "0": menu_label("\uf067", "Add a server"), "b": "Back"},
-        default="1" if targets else "0",
-    )
-    if choice in (None, "b"):
-        return None
-    if choice == "0":
-        target = add_target(targets)
-        if target is not None:
-            save(path, targets + [target])
-        return target
-    return targets[int(choice) - 1]
+    while True:
+        targets = load(path, [])
+        choices = {str(index): target["ssh"] for index, target in enumerate(targets, 1)}
+        options = {**choices, "0": menu_label("\uf067", "Add a server")}
+        if targets:
+            options["r"] = "Remove a saved server"
+        options["b"] = "Back"
+        choice = choose("Deploy / Select a server", options, default="1" if targets else "0")
+        if choice in (None, "b"):
+            return None
+        if choice == "r":
+            remove_target(path, targets, choices)
+            continue
+        if choice == "0":
+            target = add_target(targets)
+            if target is not None:
+                update_saved_targets(path, new=target)
+            return target
+        return targets[int(choice) - 1]
 
 
 def secret(reference):
@@ -425,15 +495,22 @@ def shadow_config(endpoint, password):
     }
 
 
+def resolve_target_secret(target, key):
+    value = target[key]
+    if value.startswith("op://"):
+        value = secret(value)
+    validate_target_secret(key, value)
+    return value
+
+
 def bundle(record, target, port):
-    psk = secret(target["psk"])
-    if not re.fullmatch(r"[!-~]+", psk) or "#" in psk or ";" in psk:
-        raise ValueError("The Snell PSK contains whitespace, non-ASCII characters, or INI comment delimiters.")
+    psk = resolve_target_secret(target, "psk")
+    password = resolve_target_secret(target, "password")
     files = {
         "compose.yaml": (ROOT / "deploy" / "compose.yaml").read_bytes(),
         ".env": f"SNELL_IMAGE={record['image']}\nPUBLIC_PORT={port}\n".encode(),
         "snell.conf": f"[snell-server]\nlisten = 0.0.0.0:28261\npsk = {psk}\n".encode(),
-        "shadow-tls.json": json.dumps(shadow_config(target["tls"], secret(target["password"]))).encode(),
+        "shadow-tls.json": json.dumps(shadow_config(target["tls"], password)).encode(),
         "build-record.json": json.dumps(record, indent=2).encode(),
     }
     archive = io.BytesIO()
@@ -493,6 +570,24 @@ def login_to_docker_hub(target, script, default_username):
         return True
 
 
+def replacement_target(target):
+    choice = choose(
+        "Deploy / Replace the managed deployment",
+        {"1": "Use saved credentials", "2": "Change PSK or password", "b": "Back"},
+        default="1",
+    )
+    if choice in (None, "b"):
+        return None
+    if choice == "1":
+        return target
+    print("  Enter a password or an op:// reference. Press Enter to keep the saved value.")
+    return {
+        **target,
+        "psk": prompt_target_secret("psk", "  Snell PSK: ", target["psk"]),
+        "password": prompt_target_secret("password", "  ShadowTLS password: ", target["password"]),
+    }
+
+
 def deploy():
     version = select_release("Deploy")
     if version is None:
@@ -502,11 +597,19 @@ def deploy():
         return
     port = checked_target(target)
     script = (ROOT / "deploy" / "remote.sh").read_text()
-    remote(target, script, "preflight")
+    state = remote(target, script, "preflight")
+    replacing = state != "new"
+    if replacing and not re.fullmatch(r"\d+:\d+:\d+", state):
+        raise ValueError("The server did not return a valid deployment state.")
+    saved_target = target
+    if replacing:
+        target = replacement_target(target)
+        if target is None:
+            return
     print(f"  Server       {target['ssh']}")
     record = build(version, reuse=True)
     print(f"  New release  {version}\n  Public port  {port}/tcp\n  Image        {record['image']}")
-    if input("  Read the 1Password secrets and prepare the deployment? Type stage: ").strip() != "stage":
+    if input("  Prepare the deployment with the configured credentials? Type stage: ").strip() != "stage":
         print("  Deployment canceled.")
         return
     archive = bundle(record, target, port)
@@ -524,13 +627,30 @@ def deploy():
         raise ValueError("The server did not return a valid staging directory. Check the remote state.")
     try:
         print(f"  Deployment prepared on {target['ssh']}.")
-        if input("  Verify the port and start the new services? Type start: ").strip() != "start":
+        confirmation = "replace" if replacing else "start"
+        prompt = (
+            "  Replace the managed services? Existing connections will be interrupted. Type replace: "
+            if replacing else "  Verify the port and start the new services? Type start: "
+        )
+        if input(prompt).strip() != confirmation:
             print("  Deployment canceled.")
             return
-        print(remote(target, script, "start", stage, str(port)))
+        print(remote(target, script, "start", stage, state))
+        if target != saved_target:
+            try:
+                saved = update_saved_targets(STATE / "servers.json", old=saved_target, new=target)
+            except (OSError, ValueError) as exc:
+                print(f"  The new credentials were deployed. Could not update the local server list: {exc}")
+            else:
+                if not saved:
+                    print("  The local server entry changed. The new credentials were deployed but not saved locally.")
     finally:
-        remote(target, script, "discard", stage)
-    print("  Containers started. Test the proxy connection from your client.")
+        try:
+            remote(target, script, "discard", stage)
+        except (OSError, subprocess.CalledProcessError):
+            print(f"  Could not discard {stage} on {target['ssh']}. Check the remote deployment directory.")
+    outcome = "Managed deployment replaced." if replacing else "Containers started."
+    print(f"  {outcome} Test the proxy connection from your client.")
 
 
 def main():
