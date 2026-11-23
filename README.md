@@ -42,11 +42,17 @@ To remove a saved entry, choose **Remove a saved server** in **Deploy / Select a
 
 Choose `stage` to read the credentials and prepare the deployment. If Docker Hub denies the private image pull, enter your Docker Hub username and a read-only access token or its `op://` reference at the hidden prompt. Docker saves the login on the target server for the SSH user, and the tool retries the pull. Enter `start` to activate the new project, then verify the connection from your client.
 
+### Container network
+
+**Bridge** is the default, including for previously saved servers. Docker publishes the public TCP port for ShadowTLS. Choose **Host** for a deployment that needs to avoid Docker bridge NAT for UDP relay, such as a Surge Ponte relay. In host mode ShadowTLS binds the public TCP port directly, and Snell listens on `127.0.0.1:28261` (or `28262` if the public port is `28261`). The selected mode is saved after a successful deployment.
+
+Before switching to host mode, check that the host and provider firewalls allow the intended public TCP port. Host mode does not publish Docker ports. Ponte also depends on the UDP behavior of the host and upstream network. Run the client's UDP NAT test after deployment and verify that it reports Full Cone NAT before using the proxy as a Ponte relay.
+
 ## Replace a managed deployment
 
 Select the existing server in **Prepare and deploy**. Choose **Use saved credentials** or **Change PSK or password**. In the credential prompts, press Enter to keep a saved value. Enter `stage` to validate the new configuration and pull its images while the current services keep running. Enter `replace` to switch the configuration and recreate both containers. This interrupts existing proxy connections. Newly entered credentials are saved locally after the remote startup succeeds. Update your client with the same values.
 
-If Compose reports a startup failure during replacement, the tool restores the previous files and attempts to restart the previous services. A successful Compose startup checks container state. Verify the proxy and credentials with your client.
+If startup fails during replacement, the tool restores the previous files and attempts to restart the previous services. For host mode it also checks that the public and loopback listeners appear. Verify reachability and credentials from your client after startup.
 
 If a replacement is interrupted and leaves `~/.local/share/snell-server/rollback`, resolve that state on the host before deploying again. To restore the previous deployment, move any current `active` directory aside to an unused private path, rename `rollback` to `active`, and run the following from `active`. If the previous files are already in `active` after an unsuccessful restart, run the command there directly.
 

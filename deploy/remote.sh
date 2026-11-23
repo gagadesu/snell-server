@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-unset SNELL_IMAGE PUBLIC_PORT COMPOSE_PROFILES
+unset SNELL_IMAGE PUBLIC_PORT SNELL_NETWORK_MODE SNELL_BACKEND_PORT COMPOSE_PROFILES
 
 root="$HOME/.local/share/snell-server"
 active="$root/active"
@@ -45,16 +45,50 @@ compose() {
     docker compose --project-name "$project" --env-file "$compose_directory/.env" -f "$compose_directory/compose.yaml" "$@"
 }
 
-public_port() {
-    value="$(sed -n 's/^PUBLIC_PORT=//p' "$1/.env")" || fail 'Could not read the public port.'
-    case "$value" in ''|*[!0-9]*) fail 'Invalid public port in deployment files.' ;; esac
-    [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || fail 'Invalid public port in deployment files.'
+deployment_port() {
+    value="$(sed -n "s/^$2=//p" "$1/.env")" || fail "Could not read $2."
+    case "$value" in ''|*[!0-9]*) fail "Invalid $2 in deployment files." ;; esac
+    [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || fail "Invalid $2 in deployment files."
     printf '%s\n' "$value"
+}
+
+deployment_network() {
+    mode="$(sed -n 's/^SNELL_NETWORK_MODE=//p' "$1/.env")" || fail 'Could not read the container network mode.'
+    case "${mode:-bridge}" in
+        bridge|host) printf '%s\n' "${mode:-bridge}" ;;
+        *) fail 'Invalid container network mode in deployment files.' ;;
+    esac
+}
+
+check_port_available() {
+    [ "$1" != "$2" ] && [ "$1" != "$3" ] || return 0
+    listeners="$(ss -H -lnt "sport = :$1")" || fail "Could not check TCP port $1."
+    [ -z "$listeners" ] || fail "TCP port $1 is in use. Free it before starting the new services."
+}
+
+host_listeners_ready() {
+    public="$(deployment_port "$1" PUBLIC_PORT)" || return 1
+    backend="$(deployment_port "$1" SNELL_BACKEND_PORT)" || return 1
+    for attempt in 1 2 3 4 5 6; do
+        listeners="$(ss -H -lnt)" || return 1
+        if printf '%s\n' "$listeners" | awk -v public="0.0.0.0:$public" -v backend="127.0.0.1:$backend" '
+            $4 == public { front = 1 }
+            $4 == backend { back = 1 }
+            END { exit !(front && back) }
+        '; then
+            return 0
+        fi
+        [ "$attempt" -eq 6 ] || sleep 1
+    done
+    printf '%s\n' 'Host network listeners did not become ready on the public and loopback addresses.' >&2
+    return 1
 }
 
 start_services() {
     # Credential changes are bind-mounted file changes and may leave the Compose model identical.
-    compose "$active" up --detach --force-recreate --pull never --wait --wait-timeout 30 >&2
+    compose "$active" up --detach --force-recreate --pull never --wait --wait-timeout 30 >&2 || return 1
+    active_mode="$(deployment_network "$active")" || return 1
+    [ "$active_mode" != host ] || host_listeners_ready "$active"
 }
 
 operation="$1"
@@ -116,15 +150,23 @@ case "$operation" in
         state="$(deployment_state)" || exit 1
         [ "$state" = "$3" ] || fail 'The managed deployment changed while you were preparing. Start a new deployment.'
         [ -d "$stage" ] && [ ! -L "$stage" ] || fail 'The staged deployment does not exist.'
-        port="$(public_port "$stage")" || exit 1
+        port="$(deployment_port "$stage" PUBLIC_PORT)" || exit 1
+        mode="$(deployment_network "$stage")" || exit 1
         previous_port=''
+        previous_backend=''
         if [ "$state" != new ]; then
-            previous_port="$(public_port "$active")" || exit 1
+            previous_port="$(deployment_port "$active" PUBLIC_PORT)" || exit 1
+            previous_mode="$(deployment_network "$active")" || exit 1
+            if [ "$previous_mode" = host ]; then
+                previous_backend="$(deployment_port "$active" SNELL_BACKEND_PORT)" || exit 1
+            fi
             compose "$active" config --quiet || fail 'The current Compose configuration cannot be restored.'
         fi
-        if [ "$port" != "$previous_port" ]; then
-            listeners="$(ss -H -lnt "sport = :$port")" || fail 'Could not check the public port.'
-            [ -z "$listeners" ] || fail 'The public port is in use. Free it before starting the new services.'
+        check_port_available "$port" "$previous_port" "$previous_backend"
+        if [ "$mode" = host ]; then
+            backend="$(deployment_port "$stage" SNELL_BACKEND_PORT)" || exit 1
+            [ "$backend" != "$port" ] || fail 'The public and loopback TCP ports must differ.'
+            check_port_available "$backend" "$previous_port" "$previous_backend"
         fi
         if [ "$state" != new ]; then
             mv -T -- "$active" "$rollback"

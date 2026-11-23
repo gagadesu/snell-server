@@ -31,6 +31,7 @@ IMAGE = r"docker\.io/[a-z0-9_-]+/[a-z0-9._-]+@sha256:[a-f0-9]{64}"
 SSH_ALIAS = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 WORKFLOW = "build.yml"
 PULL_AUTH_REQUIRED = 20  # Exit status reserved by deploy/remote.sh.
+SNELL_BACKEND_PORT = 28261
 
 
 def menu_label(icon, label):
@@ -306,6 +307,7 @@ def checked_target(target):
     port = int(target["port"])
     if not 1 <= port <= 65535:
         raise ValueError("The public TCP port must be between 1 and 65535.")
+    deployment_network(target)
     endpoint = target["tls"]
     if not re.fullmatch(r"[A-Za-z0-9.-]+(?::\d{1,5})?", endpoint):
         raise ValueError("Enter a handshake hostname or hostname:port.")
@@ -315,6 +317,13 @@ def checked_target(target):
         if not target[key].startswith("op://"):
             validate_target_secret(key, target[key])
     return port
+
+
+def deployment_network(target):
+    mode = target.get("network_mode", "bridge")
+    if mode not in ("bridge", "host"):
+        raise ValueError("The deployment network mode must be bridge or host.")
+    return mode
 
 
 def unquote(value):
@@ -477,13 +486,13 @@ def secret(reference):
     return value.stdout.decode()
 
 
-def shadow_config(endpoint, password):
+def shadow_config(endpoint, password, *, listen_port=8443, backend="snell:28261"):
     return {
         "v3": True,
         "strict": False,
         "server": {
-            "listen": "0.0.0.0:8443",
-            "server_addr": "snell:28261",
+            "listen": f"0.0.0.0:{listen_port}",
+            "server_addr": backend,
             "tls_addr": {
                 "wildcard_sni": "off",
                 "dispatch": {},
@@ -506,11 +515,21 @@ def resolve_target_secret(target, key):
 def bundle(record, target, port):
     psk = resolve_target_secret(target, "psk")
     password = resolve_target_secret(target, "password")
+    env = f"SNELL_IMAGE={record['image']}\nPUBLIC_PORT={port}\n"
+    compose_file = "compose.yaml"
+    snell_listen = f"0.0.0.0:{SNELL_BACKEND_PORT}"
+    shadow = shadow_config(target["tls"], password)
+    if deployment_network(target) == "host":
+        backend_port = SNELL_BACKEND_PORT + (port == SNELL_BACKEND_PORT)
+        snell_listen = f"127.0.0.1:{backend_port}"
+        shadow = shadow_config(target["tls"], password, listen_port=port, backend=snell_listen)
+        compose_file = "compose.host.yaml"
+        env += f"SNELL_NETWORK_MODE=host\nSNELL_BACKEND_PORT={backend_port}\n"
     files = {
-        "compose.yaml": (ROOT / "deploy" / "compose.yaml").read_bytes(),
-        ".env": f"SNELL_IMAGE={record['image']}\nPUBLIC_PORT={port}\n".encode(),
-        "snell.conf": f"[snell-server]\nlisten = 0.0.0.0:28261\npsk = {psk}\n".encode(),
-        "shadow-tls.json": json.dumps(shadow_config(target["tls"], password)).encode(),
+        "compose.yaml": (ROOT / "deploy" / compose_file).read_bytes(),
+        ".env": env.encode(),
+        "snell.conf": f"[snell-server]\nlisten = {snell_listen}\npsk = {psk}\n".encode(),
+        "shadow-tls.json": json.dumps(shadow).encode(),
         "build-record.json": json.dumps(record, indent=2).encode(),
     }
     archive = io.BytesIO()
@@ -606,9 +625,25 @@ def deploy():
         target = replacement_target(target)
         if target is None:
             return
+    mode = deployment_network(target)
+    choice = choose(
+        "Deploy / Container network",
+        {"1": "Bridge (Docker port publishing)", "2": "Host (for Ponte UDP relay)", "b": "Back"},
+        default="1" if mode == "bridge" else "2",
+    )
+    if choice in (None, "b"):
+        return
+    selected_mode = "bridge" if choice == "1" else "host"
+    if selected_mode != mode:
+        target = {**target, "network_mode": selected_mode}
     print(f"  Server       {target['ssh']}")
     record = build(version, reuse=True)
-    print(f"  New release  {version}\n  Public port  {port}/tcp\n  Image        {record['image']}")
+    print(
+        f"  New release  {version}\n  Public port  {port}/tcp\n"
+        f"  Network      {selected_mode}\n  Image        {record['image']}"
+    )
+    if selected_mode == "host":
+        print("  The host firewall must allow the public TCP port and any UDP traffic required by Ponte.")
     if input("  Prepare the deployment with the configured credentials? Type stage: ").strip() != "stage":
         print("  Deployment canceled.")
         return
@@ -640,10 +675,10 @@ def deploy():
             try:
                 saved = update_saved_targets(STATE / "servers.json", old=saved_target, new=target)
             except (OSError, ValueError) as exc:
-                print(f"  The new credentials were deployed. Could not update the local server list: {exc}")
+                print(f"  The settings were deployed. Could not update the local server list: {exc}")
             else:
                 if not saved:
-                    print("  The local server entry changed. The new credentials were deployed but not saved locally.")
+                    print("  The local server entry changed. The settings were deployed but not saved locally.")
     finally:
         try:
             remote(target, script, "discard", stage)

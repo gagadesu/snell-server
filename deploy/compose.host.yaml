@@ -1,0 +1,27 @@
+services:
+  snell:
+    image: ${SNELL_IMAGE:?Snell digest required}
+    platform: linux/amd64
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./snell.conf:/run/secrets/snell.conf:ro
+  shadow-tls:
+    image: ghcr.io/ihciah/shadow-tls@sha256:6c3284695af4b9ec83ec0eafe67a55d7f22af95cef943617728ea252759b5a19
+    platform: linux/amd64
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - snell
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      MONOIO_FORCE_LEGACY_DRIVER: "1"
+      RUST_LOG: warn
+    entrypoint: ["shadow-tls", "config", "--config", "/run/secrets/shadow-tls.json"]
+    volumes:
+      - ./shadow-tls.json:/run/secrets/shadow-tls.json:ro
